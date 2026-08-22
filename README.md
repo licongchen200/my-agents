@@ -26,3 +26,56 @@ An **orchestrator** runs persistently on my VPS and coordinates two types of **w
 - **Review** — changes are merged via pull requests, which I review from the GitHub mobile app.
 - **Deploys** — pushes to `main` trigger a GitHub Actions workflow that SSHes into the VPS, pulls the latest code, and restarts the worker.
 - **Secrets** — never committed here and never placed in Notion or Slack. Agents reference secrets by name only; values are injected into the process environment at runtime.
+
+## Running the orchestrator
+
+`orchestrator.py` is the poll loop. Standard library only — no pip install, no venv needed.
+
+```bash
+python3 orchestrator.py          # runs until stopped
+python3 test_orchestrator.py     # claim/lease self-check, no network
+```
+
+### Configuration
+
+All config is environment variables. No secret is ever read from a spec or written into one.
+
+| Variable | Required | Default | What it does |
+|---|---|---|---|
+| `NOTION_TOKEN` | yes | — | Internal integration secret. The integration must also be added to the Specs database via ••• → Connections, or the API returns 404. |
+| `NOTION_DATABASE_ID` | yes | — | The Specs database id. |
+| `WORKER_CMD_BACKEND` | one of | — | Shell command that executes a backend spec. |
+| `WORKER_CMD_IOS` | these | — | Shell command for iOS specs. Leave unset until the Mac worker exists — unset means those specs are left unclaimed rather than claimed and dropped. |
+| `SLACK_TOKEN` | no | — | `xoxb-` bot token, invited to the channel. Status posting is skipped if absent. |
+| `SLACK_CHANNEL` | no | — | Channel id, e.g. `C0BRL28RM6K`. |
+| `DB_PATH` | no | `orchestrator.db` | SQLite task table. |
+| `POLL_SECONDS` | no | `60` | Idle poll interval. |
+| `LEASE_SECONDS` | no | `1800` | How long a claim is valid, and the worker timeout. |
+| `MAX_ATTEMPTS` | no | `3` | Attempts before a spec is marked `failed`. |
+
+The worker command receives `SPEC_URL`, `SPEC_NAME`, `SPEC_REPO`, and `SPEC_PROJECT` in its
+environment. Exit 0 means done; any other exit is an attempt that will be retried until the
+limit is reached.
+
+### Claiming and leases
+
+A spec is claimed before it is dispatched, so a slow status write or a restart mid-dispatch
+cannot hand the same spec to two workers. Every claim carries an owner, an expiry, and an
+attempt count. A worker that dies stops renewing its lease; the orchestrator reclaims the
+spec, increments attempts, and re-dispatches. Only a spec that exhausts `MAX_ATTEMPTS` is
+marked `failed`. Nothing sits at `in progress` forever.
+
+### Approvals
+
+The state machine does not care who carries a question. It needs two functions:
+
+```python
+notify(task, question) -> handle
+check_reply(handle) -> reply | None
+```
+
+They ship implemented against a Slack thread, because that works with only the bot token.
+The intended successor is the iOS app — `POST /approvals` triggering APNs, and
+`GET /approvals/{id}` returning the answer — which is a better fit because a reply can be a
+full free-text prompt or a revised spec, not just yes/no. Swapping those two functions moves
+nothing else.
