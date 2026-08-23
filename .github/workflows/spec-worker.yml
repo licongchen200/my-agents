@@ -51,7 +51,10 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: --max-turns 40
+          # The runner is an ephemeral throwaway container, which is the one place
+          # skipping permission prompts is low risk. Without this the session is denied
+          # write access and finishes having changed nothing.
+          claude_args: --max-turns 40 --dangerously-skip-permissions
           prompt: |
             You are a worker agent. Implement the specification below, end to end.
 
