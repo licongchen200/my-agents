@@ -25,6 +25,11 @@ SPEC_REPO = os.environ.get("SPEC_REPO", "")
 SPEC_PROJECT = os.environ.get("SPEC_PROJECT", "")
 
 WORK_ROOT = os.environ.get("WORK_ROOT", "/root/apps/orchestrator/work")
+SPECS_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
+# A session is sized for one focused change. Anything the planner judges bigger is split
+# into child specs rather than attempted in one shot and timing out at the lease.
+SESSION_MINUTES = int(os.environ.get("SESSION_MINUTES", "40"))
+EXIT_SPLIT = 2  # orchestrator maps this to status=split and does NOT retry
 CLAUDE = os.environ.get("CLAUDE_BIN", "/root/.local/bin/claude")
 # The user chose to run headless sessions without permission prompts.
 # ponytail: unrestricted Bash as whoever runs this; run as a dedicated non-root
@@ -43,10 +48,13 @@ def run(cmd, cwd=None, check=True, capture=True):
 
 # --- Notion: spec body -> brief ---------------------------------------------
 
-def notion(path):
-    req = urllib.request.Request(f"https://api.notion.com/v1{path}")
+def notion(path, method="GET", body=None):
+    req = urllib.request.Request(f"https://api.notion.com/v1{path}",
+                                 data=json.dumps(body).encode() if body else None,
+                                 method=method)
     req.add_header("Authorization", f"Bearer {NOTION_TOKEN}")
     req.add_header("Notion-Version", "2022-06-28")
+    req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())
 
@@ -114,6 +122,87 @@ your final message. If the spec cannot be done at all, change nothing and say wh
 --- END SPECIFICATION ---"""
 
 
+
+# --- Decomposition ------------------------------------------------------------
+
+PLAN_PROMPT = """Assess the specification below. Do NOT implement anything.
+
+One worker session is a single focused change: roughly under {minutes} minutes of work,
+touching a coherent set of files, reviewable as one pull request. Provisioning a machine
+end to end is not one session. Adding one file, one endpoint, or one schema is.
+
+Reply with ONLY a JSON object, no prose and no code fence:
+
+{{"decompose": false}}
+
+or
+
+{{"decompose": true, "reason": "<one sentence>", "children": [
+  {{"name": "<short imperative spec title>", "brief": "<self-contained brief: goal, tasks, acceptance criteria>"}}
+]}}
+
+Split only if genuinely too large. Prefer 2 to 6 children. Each child must stand alone: a
+worker with no memory of this spec or its siblings must be able to act on it. Order them so
+that run in sequence each makes sense. Do not invent work the spec does not ask for, and do
+not split merely because the spec has several checkboxes.
+
+--- SPECIFICATION ---
+{body}
+--- END SPECIFICATION ---"""
+
+
+def plan_split(body):
+    """Ask whether this is one session's work. Returns a plan dict, or None to proceed."""
+    args = [a for a in CLAUDE_ARGS if a not in ("--output-format", "text")]
+    r = subprocess.run([CLAUDE, "-p", PLAN_PROMPT.format(minutes=SESSION_MINUTES, body=body),
+                        "--output-format", "text", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"[worker] planner failed, proceeding unsplit: {(r.stderr or '')[-300:]}", flush=True)
+        return None
+    text = (r.stdout or "").strip()
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        print(f"[worker] planner gave no JSON, proceeding unsplit: {text[:200]!r}", flush=True)
+        return None
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        print("[worker] planner JSON unparseable, proceeding unsplit", flush=True)
+        return None
+
+
+def create_child_specs(plan):
+    """Write child specs back into the Specs database. Returns their urls."""
+    if not SPECS_DATABASE_ID:
+        raise RuntimeError("NOTION_DATABASE_ID is not set; cannot create child specs")
+    children = plan.get("children") or []
+    if not children:
+        return []
+    urls = []
+    for i, child in enumerate(children, 1):
+        page = notion("/pages", "POST", {
+            "parent": {"database_id": SPECS_DATABASE_ID},
+            "properties": {
+                "Name": {"title": [{"text": {"content": str(child["name"])[:200]}}]},
+                "Status": {"select": {"name": "not started"}},
+                "Task type": {"select": {"name": os.environ.get("SPEC_TASK_TYPE", "backend")}},
+                "Project": {"rich_text": [{"text": {"content": SPEC_PROJECT}}]},
+                "Repo": {"url": SPEC_REPO or None},
+                "Parent": {"url": SPEC_URL},
+            },
+            "children": [
+                {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [
+                    {"text": {"content": f"Step {i} of {len(children)}, split out of "
+                                         f"{SPEC_NAME}."}}]}},
+                {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [
+                    {"text": {"content": str(child["brief"])[:1900]}}]}},
+            ],
+        })
+        urls.append(page["url"])
+        print(f"[worker]   child {i}: {child['name']} -> {page['url']}", flush=True)
+    return urls
+
+
 # --- GitHub ------------------------------------------------------------------
 
 def repo_slug(url):
@@ -148,6 +237,15 @@ def main():
     body = blocks_to_text(page)
     if not body.strip():
         sys.exit(f"spec {SPEC_URL} has no body to act on")
+
+    plan = plan_split(body)
+    if plan and plan.get("decompose"):
+        print(f"[worker] too big for one session: {plan.get('reason', '')}", flush=True)
+        urls = create_child_specs(plan)
+        if urls:
+            print(f"[worker] split into {len(urls)} child spec(s)", flush=True)
+            sys.exit(EXIT_SPLIT)
+        print("[worker] planner said split but produced no children; proceeding", flush=True)
 
     slug = repo_slug(SPEC_REPO)
     branch = f"worker/{slug_for(SPEC_NAME)}"
