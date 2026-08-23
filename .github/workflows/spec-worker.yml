@@ -26,6 +26,9 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # The action exchanges an OIDC token for GitHub credentials. Without this it fails
+  # with "Could not fetch an OIDC token" before ever starting a session.
+  id-token: write
 
 jobs:
   run:
