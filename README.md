@@ -82,11 +82,13 @@ nothing else.
 
 ### Secrets
 
-Secrets live in Infisical (project `my-agents`, env `production`) and are injected into the
-process environment at start. Nothing is read from a spec, and no value is committed here.
+Secrets live in Infisical (project `my-agents`, env **`prod`** — the slug is `prod`, not
+`production`; `production` silently returns zero secrets) and are injected into the process
+environment at start. Nothing is read from a spec, and no value is committed here.
 
 ```bash
-infisical run --projectId <id> --env=production -- python3 orchestrator.py
+infisical run --domain=https://secrets.licongchen.org/api \
+  --projectId=2e72577a-f0ac-43a7-95e5-b2d3f0f1ebb1 --env=prod -- python3 orchestrator.py
 ```
 
 `NOTION_DATABASE_ID` and `SLACK_CHANNEL` are configuration, not secrets — set them directly
@@ -104,3 +106,23 @@ tree becomes readable in one step and new spec pages need no further sharing.
 `CLAUDE_CODE_OAUTH_TOKEN` is the *worker's* credential for headless Agent SDK sessions, not
 the orchestrator's. `SLACK_APP_TOKEN` (`xapp-`) is only needed for Socket Mode, which was
 ruled out in favour of the iOS app for approvals — it is unused by this code.
+
+### Slack app scopes
+
+The bot needs exactly two things, and posting working is not evidence that reading will:
+
+| Scope | Used by | Symptom if absent |
+|---|---|---|
+| `chat:write` | `chat.postMessage` | cannot post status |
+| `channels:history` | `conversations.replies` | cannot read an approval reply |
+
+`channels:read` is only needed if `SLACK_CHANNEL` is a name rather than an id. Pass the id and
+you can skip it.
+
+The bot must also be **invited to the channel** — `/invite @orchagent`. With `chat:write.public`
+an app can post to a public channel it has not joined, so status posting succeeds while
+`conversations.replies` returns `not_in_channel`. Posting is not proof of membership.
+
+Slack read methods reject a JSON body. `conversations.replies` and `conversations.list` are
+GET with query params; posting JSON to them returns `invalid_arguments`, which reads like a
+caller bug rather than the wrong HTTP shape.

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -91,8 +92,19 @@ def notion(method, path, body=None):
 
 
 def slack(api, body):
+    """Write methods take a JSON body."""
     r = http("POST", f"https://slack.com/api/{api}",
              {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}, body)
+    if not r.get("ok"):
+        raise RuntimeError(f"slack {api} failed: {r.get('error')}")
+    return r
+
+
+def slack_get(api, params):
+    """Read methods reject a JSON body — they need GET with query params. Posting a
+    JSON body to conversations.replies returns invalid_arguments, not a useful error."""
+    url = f"https://slack.com/api/{api}?" + urllib.parse.urlencode(params)
+    r = http("GET", url, {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"})
     if not r.get("ok"):
         raise RuntimeError(f"slack {api} failed: {r.get('error')}")
     return r
@@ -107,9 +119,9 @@ def resolve_channel(name_or_id):
     wanted = name_or_id.lstrip("#")
     cursor = None
     while True:
-        r = slack("conversations.list", {"limit": 200, "exclude_archived": True,
-                                         "types": "public_channel,private_channel",
-                                         **({"cursor": cursor} if cursor else {})})
+        r = slack_get("conversations.list", {"limit": 200, "exclude_archived": "true",
+                                             "types": "public_channel,private_channel",
+                                             **({"cursor": cursor} if cursor else {})})
         for c in r.get("channels", []):
             if c.get("name") == wanted:
                 return c["id"]
@@ -144,7 +156,7 @@ def notify(task, question):
 
 
 def check_reply(handle):
-    r = slack("conversations.replies", {"channel": SLACK_CHANNEL, "ts": handle, "limit": 20})
+    r = slack_get("conversations.replies", {"channel": SLACK_CHANNEL, "ts": handle, "limit": 20})
     for m in r.get("messages", [])[1:]:
         if not m.get("bot_id"):
             return m.get("text")
