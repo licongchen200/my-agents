@@ -6,11 +6,11 @@ import os
 import tempfile
 from datetime import timedelta
 
-os.environ.setdefault("WORKER_CMD_BACKEND", "true")
+os.environ.setdefault("WORKER_CMD_INFRA", "true")
 import orchestrator as o
 
 
-def seed(db, spec_url="https://notion.so/spec-1", task_type="backend"):
+def seed(db, spec_url="https://notion.so/spec-1", task_type="infra"):
     db.execute("""INSERT INTO tasks (spec_url, spec_id, name, task_type, status, attempts,
                                      created_at, updated_at)
                   VALUES (?, 1, 'test spec', ?, 'not started', 0, ?, ?)""",
@@ -63,8 +63,22 @@ def test_unknown_task_type_is_left_alone():
     """ios specs must not be claimed while no Mac worker exists."""
     db = o.connect(tempfile.mktemp(suffix=".db"))
     seed(db, task_type="ios")
-    assert o.claim(db, owner="a", task_types=["backend"]) is None
+    assert o.claim(db, owner="a", task_types=["infra"]) is None
     assert db.execute("SELECT status FROM tasks").fetchone()["status"] == "not started"
+
+
+def test_backend_routes_to_cloud_not_a_local_command():
+    """backend specs must never run a local shell command — a cloud runner handles them.
+
+    If backend ever appears in WORKERS as a command string, work that assumed an ephemeral
+    isolated runner would instead execute on the VPS.
+    """
+    assert o.WORKERS.get("backend") in (None, "cloud"), o.WORKERS.get("backend")
+
+
+def test_infra_stays_local():
+    """infra specs must run on the box, since a cloud runner cannot reach the VPS."""
+    assert o.WORKERS.get("infra") == "true"
 
 
 def test_pull_specs_is_idempotent():
@@ -74,7 +88,7 @@ def test_pull_specs_is_idempotent():
     seed_again = db.execute(
         """INSERT INTO tasks (spec_url, spec_id, name, task_type, status, attempts,
                               created_at, updated_at)
-           VALUES ('https://notion.so/spec-1', 1, 'test spec', 'backend', 'not started', 0, ?, ?)
+           VALUES ('https://notion.so/spec-1', 1, 'test spec', 'infra', 'not started', 0, ?, ?)
            ON CONFLICT(spec_url) DO NOTHING""", (o.iso(o.now()), o.iso(o.now())))
     row = db.execute("SELECT attempts, status FROM tasks").fetchone()
     assert row["status"] == "in progress", "re-pull reset a claimed task"

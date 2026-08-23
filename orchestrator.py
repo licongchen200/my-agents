@@ -34,8 +34,19 @@ OWNER = os.environ.get("OWNER", f"orchestrator-{os.getpid()}")
 
 # Task type -> shell command template. A type with no command here is left unclaimed,
 # so ios specs sit untouched until the Mac worker exists rather than being claimed and lost.
-WORKERS = {t: os.environ[k] for t, k in (("backend", "WORKER_CMD_BACKEND"),
+# Task type -> how the work runs. A type with no entry here is left unclaimed, so specs
+# for a worker that does not exist yet sit untouched rather than being claimed and dropped.
+WORKERS = {t: os.environ[k] for t, k in (("infra", "WORKER_CMD_INFRA"),
                                          ("ios", "WORKER_CMD_IOS")) if k in os.environ}
+
+# backend specs run on an ephemeral GitHub runner instead of this box. A cloud runner
+# cannot touch the VPS, which is why infra stays local rather than moving too.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+CLOUD_WORKFLOW = os.environ.get("CLOUD_WORKFLOW", "spec-worker.yml")
+CLOUD_REPO = os.environ.get("CLOUD_REPO", "")
+CLOUD_REF = os.environ.get("CLOUD_REF", "main")
+if GITHUB_TOKEN and CLOUD_REPO:
+    WORKERS["backend"] = "cloud"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -283,7 +294,22 @@ def finish(db, spec_url, status, error=None):
 
 # --- Dispatch ---------------------------------------------------------------
 
+def spec_body(spec_url):
+    """Flatten the spec page so it can be passed to a cloud runner that has no Notion token."""
+    page_id = spec_url.rstrip("/").split("/")[-1].split("?")[0].split("-")[-1]
+    out = []
+    res = notion("GET", f"/blocks/{page_id}/children?page_size=100")
+    for b in res.get("results", []):
+        t = b.get("type")
+        rt = (b.get(t) or {}).get("rich_text")
+        if rt:
+            out.append("".join(i.get("plain_text", "") for i in rt))
+    return "\n".join(out)
+
+
 def dispatch(db, task):
+    if WORKERS.get(task["task_type"]) == "cloud":
+        return dispatch_cloud(db, task, spec_body(task["spec_url"]))
     cmd = WORKERS[task["task_type"]]
     env = {**os.environ, "SPEC_URL": task["spec_url"], "SPEC_NAME": task["name"] or "",
            "SPEC_REPO": task["repo"] or "", "SPEC_PROJECT": task["project"] or ""}
@@ -319,6 +345,69 @@ def dispatch(db, task):
         post_status(f":x: SPEC-{task['spec_id']} {task['name']} — failed attempt {task['attempts']}")
 
 
+
+# --- Cloud dispatch ----------------------------------------------------------
+
+def github(path, method="GET", body=None):
+    return http(method, f"https://api.github.com{path}",
+                {"Authorization": f"Bearer {GITHUB_TOKEN}",
+                 "Accept": "application/vnd.github+json"}, body)
+
+
+def dispatch_cloud(db, task, body_text):
+    """Fire the workflow, then poll until the run finishes or the lease runs out.
+
+    workflow_dispatch returns no run id, so the run is identified by matching the most
+    recent run of this workflow created after we fired it.
+    """
+    started = now()
+    github(f"/repos/{CLOUD_REPO}/actions/workflows/{CLOUD_WORKFLOW}/dispatches", "POST",
+           {"ref": CLOUD_REF, "inputs": {
+               "spec_url": task["spec_url"],
+               "spec_name": (task["name"] or "")[:200],
+               "spec_body": body_text[:60000],
+               "spec_project": task["project"] or "",
+           }})
+    post_status(f":cloud: SPEC-{task['spec_id']} {task['name']} — dispatched to GitHub Actions")
+
+    run = None
+    deadline = started + timedelta(seconds=LEASE_SECONDS)
+    while now() < deadline:
+        time.sleep(15)
+        runs = github(f"/repos/{CLOUD_REPO}/actions/workflows/{CLOUD_WORKFLOW}/runs"
+                      f"?event=workflow_dispatch&per_page=10").get("workflow_runs", [])
+        fresh = [r for r in runs if r["created_at"] >= iso(started)[:19]]
+        if not fresh:
+            continue
+        run = fresh[0]
+        if run["status"] == "completed":
+            break
+    if run is None:
+        finish(db, task["spec_url"], "failed", "cloud run never appeared")
+        push_status(task["spec_url"], "failed")
+        post_status(f":x: SPEC-{task['spec_id']} — dispatched but no run appeared")
+        return
+    if run["status"] != "completed":
+        finish(db, task["spec_url"], "failed",
+               f"cloud run exceeded {LEASE_SECONDS}s; not retried (deterministic)")
+        push_status(task["spec_url"], "failed")
+        post_status(f":hourglass: SPEC-{task['spec_id']} — cloud run exceeded "
+                    f"{LEASE_SECONDS // 60}m: {run['html_url']}")
+        return
+    if run["conclusion"] == "success":
+        finish(db, task["spec_url"], "done")
+        push_status(task["spec_url"], "done")
+        post_status(f":white_check_mark: SPEC-{task['spec_id']} {task['name']} — done "
+                    f"({run['html_url']})")
+    else:
+        db.execute("UPDATE tasks SET lease_expires_at=?, last_error=?, updated_at=? "
+                   "WHERE spec_url=?",
+                   (iso(now()), f"cloud run {run['conclusion']}: {run['html_url']}",
+                    iso(now()), task["spec_url"]))
+        post_status(f":x: SPEC-{task['spec_id']} {task['name']} — cloud run "
+                    f"{run['conclusion']} (attempt {task['attempts']}): {run['html_url']}")
+
+
 def tick(db):
     pull_specs(db)
     task = claim(db)
@@ -335,7 +424,7 @@ def main():
     if missing:
         sys.exit(f"missing required env: {', '.join(missing)}")
     if not WORKERS:
-        sys.exit("no worker commands configured (set WORKER_CMD_BACKEND and/or WORKER_CMD_IOS)")
+        sys.exit("no workers configured (set WORKER_CMD_INFRA, WORKER_CMD_IOS, or GITHUB_TOKEN + CLOUD_REPO for cloud backend specs)")
     global SLACK_CHANNEL
     if SLACK_BOT_TOKEN and SLACK_CHANNEL:
         SLACK_CHANNEL = resolve_channel(SLACK_CHANNEL)
