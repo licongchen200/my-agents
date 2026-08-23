@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
-SLACK_TOKEN = os.environ.get("SLACK_TOKEN", "")
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "")
 
 DB_PATH = os.environ.get("DB_PATH", "orchestrator.db")
@@ -92,7 +92,7 @@ def notion(method, path, body=None):
 
 def slack(api, body):
     r = http("POST", f"https://slack.com/api/{api}",
-             {"Authorization": f"Bearer {SLACK_TOKEN}"}, body)
+             {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}, body)
     if not r.get("ok"):
         raise RuntimeError(f"slack {api} failed: {r.get('error')}")
     return r
@@ -100,7 +100,7 @@ def slack(api, body):
 
 def post_status(text):
     """Status is one-way and best-effort. A Slack outage must not stall the queue."""
-    if not (SLACK_TOKEN and SLACK_CHANNEL):
+    if not (SLACK_BOT_TOKEN and SLACK_CHANNEL):
         return
     try:
         slack("chat.postMessage", {"channel": SLACK_CHANNEL, "text": text})

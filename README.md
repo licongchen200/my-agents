@@ -46,7 +46,7 @@ All config is environment variables. No secret is ever read from a spec or writt
 | `NOTION_DATABASE_ID` | yes | — | The Specs database id. |
 | `WORKER_CMD_BACKEND` | one of | — | Shell command that executes a backend spec. |
 | `WORKER_CMD_IOS` | these | — | Shell command for iOS specs. Leave unset until the Mac worker exists — unset means those specs are left unclaimed rather than claimed and dropped. |
-| `SLACK_TOKEN` | no | — | `xoxb-` bot token, invited to the channel. Status posting is skipped if absent. |
+| `SLACK_BOT_TOKEN` | no | — | `xoxb-` bot token, invited to the channel. Status posting is skipped if absent. |
 | `SLACK_CHANNEL` | no | — | Channel id, e.g. `C0BRL28RM6K`. |
 | `DB_PATH` | no | `orchestrator.db` | SQLite task table. |
 | `POLL_SECONDS` | no | `60` | Idle poll interval. |
@@ -79,3 +79,19 @@ The intended successor is the iOS app — `POST /approvals` triggering APNs, and
 `GET /approvals/{id}` returning the answer — which is a better fit because a reply can be a
 full free-text prompt or a revised spec, not just yes/no. Swapping those two functions moves
 nothing else.
+
+### Secrets
+
+Secrets live in Infisical (project `my-agents`, env `production`) and are injected into the
+process environment at start. Nothing is read from a spec, and no value is committed here.
+
+```bash
+infisical run --projectId <id> --env=production -- python3 orchestrator.py
+```
+
+`NOTION_DATABASE_ID` and `SLACK_CHANNEL` are configuration, not secrets — set them directly
+in the systemd unit rather than storing them in Infisical.
+
+`CLAUDE_CODE_OAUTH_TOKEN` is the *worker's* credential for headless Agent SDK sessions, not
+the orchestrator's. `SLACK_APP_TOKEN` (`xapp-`) is only needed for Socket Mode, which was
+ruled out in favour of the iOS app for approvals — it is unused by this code.
