@@ -28,7 +28,8 @@ NOTIFY_USER_ID = os.environ.get("NOTIFY_USER_ID", "")  # Notion user id to @ment
 DB_PATH = os.environ.get("DB_PATH", "orchestrator.db")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "1800"))
-MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "2"))
+EXIT_SPLIT = 2  # worker decomposed the spec into children; not a failure, never retried
 OWNER = os.environ.get("OWNER", f"orchestrator-{os.getpid()}")
 
 # Task type -> shell command template. A type with no command here is left unclaimed,
@@ -291,13 +292,26 @@ def dispatch(db, task):
         r = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True,
                            timeout=LEASE_SECONDS)
     except subprocess.TimeoutExpired:
-        finish(db, task["spec_url"], "in progress", "worker timed out; lease will expire")
-        post_status(f":hourglass: SPEC-{task['spec_id']} timed out, will be reclaimed")
+        # Deterministic, not transient: the same spec will time out again on the same
+        # budget. Retrying burns another full session for the same result, so surface it
+        # instead. Split the spec or raise LEASE_SECONDS.
+        finish(db, task["spec_url"], "failed",
+               f"worker exceeded {LEASE_SECONDS}s; not retried (deterministic)")
+        push_status(task["spec_url"], "failed")
+        post_status(f":hourglass: SPEC-{task['spec_id']} {task['name']} — exceeded "
+                    f"{LEASE_SECONDS // 60}m and was not retried. Split it, or raise the lease.")
         return
     if r.returncode == 0:
         finish(db, task["spec_url"], "done")
         push_status(task["spec_url"], "done")
         post_status(f":white_check_mark: SPEC-{task['spec_id']} {task['name']} — done")
+    elif r.returncode == EXIT_SPLIT:
+        # Too big for one session. The worker already created the children, which are
+        # queued as ordinary specs. Retrying the parent would only split it again.
+        finish(db, task["spec_url"], "split")
+        push_status(task["spec_url"], "split")
+        post_status(f":scissors: SPEC-{task['spec_id']} {task['name']} — too big for one "
+                    f"session, split into child specs")
     else:
         # Leave it in progress with a live lease expiry so the retry path owns the decision.
         db.execute("UPDATE tasks SET lease_expires_at=?, last_error=?, updated_at=? WHERE spec_url=?",

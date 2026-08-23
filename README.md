@@ -52,8 +52,9 @@ All config is environment variables. No secret is ever read from a spec or writt
 | `SLACK_CHANNEL` | no | — | Channel id or name — `C0BRL28RM6K` or `my-agents`. A name is resolved to an id once at startup, because `conversations.replies` requires an id even though `chat.postMessage` accepts a name. Needs the `channels:read` scope to resolve a name; pass the id to skip that. |
 | `DB_PATH` | no | `orchestrator.db` | SQLite task table. |
 | `POLL_SECONDS` | no | `60` | Idle poll interval. |
-| `LEASE_SECONDS` | no | `1800` | How long a claim is valid, and the worker timeout. |
-| `MAX_ATTEMPTS` | no | `3` | Attempts before a spec is marked `failed`. |
+| `LEASE_SECONDS` | no | `2400` | How long a claim is valid, and the worker timeout. |
+| `MAX_ATTEMPTS` | no | `2` | Attempts before a spec is marked `failed`. Retries exist for transient failures; deterministic ones are not retried at all (see below). |
+| `SESSION_MINUTES` | no | `40` | What the planner treats as one session's work when deciding whether to split a spec. |
 
 The worker command receives `SPEC_URL`, `SPEC_NAME`, `SPEC_REPO`, and `SPEC_PROJECT` in its
 environment. Exit 0 means done; any other exit is an attempt that will be retried until the
@@ -136,3 +137,38 @@ an app can post to a public channel it has not joined, so status posting succeed
 Slack read methods reject a JSON body. `conversations.replies` and `conversations.list` are
 GET with query params; posting JSON to them returns `invalid_arguments`, which reads like a
 caller bug rather than the wrong HTTP shape.
+
+### Spec decomposition
+
+A spec is one session's work: one focused change, one pull request. Before doing anything,
+the worker asks whether the spec is bigger than that. If it is, it writes child specs back
+into the Specs database with `Parent` pointing at the original, marks the parent `split`,
+and exits — without touching any code.
+
+```
+Spec: VPS Setup  (10 checkboxes)
+  → split
+      ├── Confirm VPS access and harden base security
+      ├── Install base runtime dependencies and SQLite
+      ├── Set up Claude Agent SDK for headless unattended use
+      ├── Build the Notion poll loop and SQLite task table
+      ├── Connect poll loop to Slack status notifications
+      └── End-to-end test and document the VPS setup
+```
+
+Children are ordinary specs, claimed and retried independently, each reviewable as its own
+PR. If the planner errors or returns unparseable output the worker proceeds unsplit, so a
+planner problem degrades to the old behaviour rather than blocking the queue.
+
+### What is and is not retried
+
+Retries are for **transient** failures — a network blip, an API hiccup. Two outcomes are
+deterministic and are never retried, because a second attempt burns a full session to reach
+the same result:
+
+| Outcome | Status | Retried |
+|---|---|---|
+| Worker exits 0 | `done` | — |
+| Worker exits 2 | `split` | no — children are queued instead |
+| Worker exceeds `LEASE_SECONDS` | `failed` | **no** — split the spec or raise the lease |
+| Worker crashes / lease expires | reclaimed | yes, up to `MAX_ATTEMPTS` |
