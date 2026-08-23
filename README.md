@@ -47,7 +47,7 @@ All config is environment variables. No secret is ever read from a spec or writt
 | `WORKER_CMD_BACKEND` | one of | — | Shell command that executes a backend spec. |
 | `WORKER_CMD_IOS` | these | — | Shell command for iOS specs. Leave unset until the Mac worker exists — unset means those specs are left unclaimed rather than claimed and dropped. |
 | `SLACK_BOT_TOKEN` | no | — | `xoxb-` bot token, invited to the channel. Status posting is skipped if absent. |
-| `SLACK_CHANNEL` | no | — | Channel id, e.g. `C0BRL28RM6K`. |
+| `SLACK_CHANNEL` | no | — | Channel id or name — `C0BRL28RM6K` or `my-agents`. A name is resolved to an id once at startup, because `conversations.replies` requires an id even though `chat.postMessage` accepts a name. Needs the `channels:read` scope to resolve a name; pass the id to skip that. |
 | `DB_PATH` | no | `orchestrator.db` | SQLite task table. |
 | `POLL_SECONDS` | no | `60` | Idle poll interval. |
 | `LEASE_SECONDS` | no | `1800` | How long a claim is valid, and the worker timeout. |
@@ -90,7 +90,16 @@ infisical run --projectId <id> --env=production -- python3 orchestrator.py
 ```
 
 `NOTION_DATABASE_ID` and `SLACK_CHANNEL` are configuration, not secrets — set them directly
-in the systemd unit rather than storing them in Infisical.
+in the systemd unit rather than storing them in Infisical:
+
+```
+NOTION_DATABASE_ID=fbc7943111a6416384f9ad95a447b0df   # the Specs database
+SLACK_CHANNEL=C0BRL28RM6K                             # #my-agents
+```
+
+The Notion integration should be shared with the **root page** `3c4ac87aab4481b099dcd02c3a04d749`
+rather than with the Specs database directly. Access cascades to every child, so the whole page
+tree becomes readable in one step and new spec pages need no further sharing.
 
 `CLAUDE_CODE_OAUTH_TOKEN` is the *worker's* credential for headless Agent SDK sessions, not
 the orchestrator's. `SLACK_APP_TOKEN` (`xapp-`) is only needed for Socket Mode, which was

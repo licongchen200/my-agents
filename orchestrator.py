@@ -98,6 +98,26 @@ def slack(api, body):
     return r
 
 
+def resolve_channel(name_or_id):
+    """Accept a channel id or a name. conversations.replies needs an id, while
+    chat.postMessage tolerates a name — so a name-only config posts status fine and
+    then silently fails to ever read an approval reply. Resolve once at startup."""
+    if not name_or_id or name_or_id.startswith(("C", "G", "D")):
+        return name_or_id
+    wanted = name_or_id.lstrip("#")
+    cursor = None
+    while True:
+        r = slack("conversations.list", {"limit": 200, "exclude_archived": True,
+                                         "types": "public_channel,private_channel",
+                                         **({"cursor": cursor} if cursor else {})})
+        for c in r.get("channels", []):
+            if c.get("name") == wanted:
+                return c["id"]
+        cursor = (r.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            raise RuntimeError(f"slack channel {name_or_id!r} not found; is the bot invited?")
+
+
 def post_status(text):
     """Status is one-way and best-effort. A Slack outage must not stall the queue."""
     if not (SLACK_BOT_TOKEN and SLACK_CHANNEL):
@@ -262,8 +282,12 @@ def main():
         sys.exit(f"missing required env: {', '.join(missing)}")
     if not WORKERS:
         sys.exit("no worker commands configured (set WORKER_CMD_BACKEND and/or WORKER_CMD_IOS)")
+    global SLACK_CHANNEL
+    if SLACK_BOT_TOKEN and SLACK_CHANNEL:
+        SLACK_CHANNEL = resolve_channel(SLACK_CHANNEL)
     db = connect()
-    print(f"orchestrator {OWNER} up; workers={list(WORKERS)}; poll={POLL_SECONDS}s")
+    print(f"orchestrator {OWNER} up; workers={list(WORKERS)}; "
+          f"channel={SLACK_CHANNEL or 'none'}; poll={POLL_SECONDS}s")
     while True:
         try:
             if not tick(db):
