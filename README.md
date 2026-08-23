@@ -47,6 +47,8 @@ All config is environment variables. No secret is ever read from a spec or writt
 | `WORKER_CMD_BACKEND` | one of | — | Shell command that executes a backend spec. |
 | `WORKER_CMD_IOS` | these | — | Shell command for iOS specs. Leave unset until the Mac worker exists — unset means those specs are left unclaimed rather than claimed and dropped. |
 | `SLACK_BOT_TOKEN` | no | — | `xoxb-` bot token, invited to the channel. Status posting is skipped if absent. |
+| `APPROVALS_DATABASE_ID` | for approvals | — | The Approvals and Requests database. Without it, a worker that parks raises rather than asking. |
+| `NOTIFY_USER_ID` | no | — | Your Notion user id, used to @mention you on an approval row. Without it the row is created but Notion may not notify you. |
 | `SLACK_CHANNEL` | no | — | Channel id or name — `C0BRL28RM6K` or `my-agents`. A name is resolved to an id once at startup, because `conversations.replies` requires an id even though `chat.postMessage` accepts a name. Needs the `channels:read` scope to resolve a name; pass the id to skip that. |
 | `DB_PATH` | no | `orchestrator.db` | SQLite task table. |
 | `POLL_SECONDS` | no | `60` | Idle poll interval. |
@@ -74,11 +76,19 @@ notify(task, question) -> handle
 check_reply(handle) -> reply | None
 ```
 
-They ship implemented against a Slack thread, because that works with only the bot token.
-The intended successor is the iOS app — `POST /approvals` triggering APNs, and
-`GET /approvals/{id}` returning the answer — which is a better fit because a reply can be a
-full free-text prompt or a revised spec, not just yes/no. Swapping those two functions moves
-nothing else.
+They are implemented against the **Approvals and Requests** database in Notion:
+
+- `notify()` creates a row (`Status = waiting for you`), @mentions you in the body, and posts
+  a one-line ping to Slack with a link to the row.
+- `check_reply()` returns the `Answer` only once `Status = answered`, so a half-typed reply is
+  never picked up mid-edit.
+
+Notion carries the payload because an answer can be free text, a correction, or a completely
+rewritten brief — which a Slack thread handles badly and a yes/no button not at all. Slack
+carries the notification because Notion notifies reliably on @mention and unreliably on a new
+row appearing. Neither tool is asked to do the thing it is bad at.
+
+Set `APPROVALS_DATABASE_ID` and `NOTIFY_USER_ID` (your Notion user id) for this to work.
 
 ### Secrets
 

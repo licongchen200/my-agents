@@ -22,6 +22,8 @@ NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "")
+APPROVALS_DATABASE_ID = os.environ.get("APPROVALS_DATABASE_ID", "")
+NOTIFY_USER_ID = os.environ.get("NOTIFY_USER_ID", "")  # Notion user id to @mention
 
 DB_PATH = os.environ.get("DB_PATH", "orchestrator.db")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
@@ -141,26 +143,52 @@ def post_status(text):
 
 
 # --- Approval seam ----------------------------------------------------------
-# The state machine does not care who carries the question. Swapping these two
-# functions to the iOS app (POST /approvals + APNs, GET /approvals/{id}) moves
-# nothing else. Slack is here because it works with only the bot token.
-# ponytail: Slack thread implementation; swap to the iOS backend once its
-# endpoint shape is confirmed (is it on this VPS, does it store a pending question).
+# Questions live in the Approvals and Requests database in Notion, where an answer can
+# be free text or a completely rewritten brief. Slack only carries the ping, because
+# Notion notifies reliably on @mention and unreliably on a new row appearing.
+# The state machine does not care: it is still just notify() and check_reply().
 
 def notify(task, question):
-    r = slack("chat.postMessage", {
-        "channel": SLACK_CHANNEL,
-        "text": f"*{task['name']}* (SPEC-{task['spec_id']}) needs you:\n{question}\n_Reply in this thread._",
+    """Create an approval row and ping Slack. Returns the row's page id as the handle."""
+    if not APPROVALS_DATABASE_ID:
+        raise RuntimeError("APPROVALS_DATABASE_ID is not set; cannot ask for approval")
+    mention = ([{"type": "mention", "mention": {"type": "user", "user": {"id": NOTIFY_USER_ID}}},
+                {"type": "text", "text": {"content": " — a worker is parked on this."}}]
+               if NOTIFY_USER_ID else
+               [{"type": "text", "text": {"content": "A worker is parked on this."}}])
+    page = notion("POST", "/pages", {
+        "parent": {"database_id": APPROVALS_DATABASE_ID},
+        "properties": {
+            "Question": {"title": [{"text": {"content": question[:200]}}]},
+            "Status": {"select": {"name": "waiting for you"}},
+            "Spec": {"url": task["spec_url"]},
+            "Spec name": {"rich_text": [{"text": {"content": task["name"] or ""}}]},
+        },
+        "children": [
+            {"object": "block", "type": "paragraph",
+             "paragraph": {"rich_text": mention}},
+            {"object": "block", "type": "paragraph",
+             "paragraph": {"rich_text": [{"text": {"content": question}}]}},
+            {"object": "block", "type": "callout",
+             "callout": {"icon": {"emoji": "✍️"},
+                         "rich_text": [{"text": {"content":
+                            "Write your reply in the Answer property, then set Status to "
+                            "answered. Free text is fine, including a fully rewritten brief. "
+                            "Nothing is read until Status is answered, so a half typed "
+                            "answer is never picked up."}}]}},
+        ],
     })
-    return r["ts"]
+    post_status(f":raising_hand: *{task['name']}* needs you — {page['url']}")
+    return page["id"]
 
 
 def check_reply(handle):
-    r = slack_get("conversations.replies", {"channel": SLACK_CHANNEL, "ts": handle, "limit": 20})
-    for m in r.get("messages", [])[1:]:
-        if not m.get("bot_id"):
-            return m.get("text")
-    return None
+    """Return the answer once the row is marked answered, else None."""
+    page = notion("GET", f"/pages/{handle}")
+    props = page.get("properties", {})
+    if plain(props.get("Status")) != "answered":
+        return None
+    return plain(props.get("Answer")) or ""
 
 
 # --- Notion sync ------------------------------------------------------------
